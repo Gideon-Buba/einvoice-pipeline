@@ -1,0 +1,27 @@
+{
+  "name": "einvoice-pipeline",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "dev": "ts-node src/pipeline.ts",
+    "build": "tsc",
+    "start": "node dist/pipeline.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "mssql": "^12.5.5",
+    "pg": "^8.21.0",
+    "tedious": "^19.2.1"
+  },
+  "devDependencies": {
+    "@types/mssql": "^12.3.0",
+    "@types/node": "^25.9.2",
+    "@types/pg": "^8.20.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.3"
+  }
+}
