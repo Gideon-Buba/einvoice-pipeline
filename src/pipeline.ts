@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { Client } from "pg";
+import { Pool } from "pg";
 import * as sql from "mssql";
 import { startApi } from "./api";
 import {
@@ -7,6 +7,7 @@ import {
   DEST_CONFIG,
   BATCH_SIZE,
   INSERT_CHUNK,
+  CONCURRENCY,
   MAX_RETRIES,
   RETRY_DELAY_MS,
   TABLE,
@@ -68,89 +69,148 @@ function buildQuery(batchStart: number, batchEnd: number): string {
   `;
 }
 
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+
+function escapeStr(val: string | null): string {
+  if (val === null || val === undefined) return "NULL";
+  return `N'${val.replace(/'/g, "''")}'`;
+}
+
+function escapeDate(val: Date | null): string {
+  if (val === null || val === undefined) return "NULL";
+  try {
+    const d = new Date(val);
+    if (isNaN(d.getTime())) return "NULL";
+    return `'${d.toISOString().slice(0, 10)}'`;
+  } catch {
+    return "NULL";
+  }
+}
+
+function escapeNum(val: number | null): string {
+  if (val === null || val === undefined || isNaN(Number(val))) return "NULL";
+  return String(val);
+}
+
 // ─── INSERT ───────────────────────────────────────────────────────────────────
+// Uses batched INSERT statements instead of bulk insert.
+// Each chunk is a single INSERT ... VALUES (...), (...) statement.
+// Regular INSERT keeps the TCP connection chatty — firewall won't kill it.
 
 async function insertRows(
-  pool: sql.ConnectionPool,
+  destPool: sql.ConnectionPool,
   rows: InvoiceRow[],
 ): Promise<number> {
   let total = 0;
+
   for (let i = 0; i < rows.length; i += INSERT_CHUNK) {
     const chunk = rows
       .slice(i, i + INSERT_CHUNK)
       .filter((r): r is InvoiceRow & { id: number } => r.id !== null);
     if (chunk.length === 0) continue;
 
-    const table = new sql.Table(TABLE);
-    table.create = false;
-    table.columns.add("id", sql.Int, { nullable: false });
-    table.columns.add("irn", sql.NVarChar(100), { nullable: true });
-    table.columns.add("issueDate", sql.Date, { nullable: true });
-    table.columns.add("taxPointDate", sql.Date, { nullable: true });
-    table.columns.add("currencyCode", sql.NVarChar(50), { nullable: true });
-    table.columns.add("invoiceTypeCode", sql.NVarChar(50), { nullable: true });
-    table.columns.add("accountingCost", sql.NVarChar(500), { nullable: true });
-    table.columns.add("paymentStatus", sql.NVarChar(50), { nullable: true });
-    table.columns.add("supplierTIN", sql.NVarChar(50), { nullable: true });
-    table.columns.add("customerTIN", sql.NVarChar(50), { nullable: true });
-    table.columns.add("totalTaxAmount", sql.Numeric(16, 2), { nullable: true });
-    table.columns.add("subtotalTaxAmount", sql.Numeric(16, 2), {
-      nullable: true,
-    });
-    table.columns.add("subtotalTaxableAmount", sql.Numeric(16, 2), {
-      nullable: true,
-    });
-    table.columns.add("taxCategoryId", sql.NVarChar(100), { nullable: true });
-    table.columns.add("taxCategoryPercent", sql.Numeric(6, 2), {
-      nullable: true,
-    });
-    table.columns.add("paymentDueDate", sql.Date, { nullable: true });
-    table.columns.add("paymentMeansCode", sql.NVarChar(50), { nullable: true });
-    table.columns.add("taxExclusiveAmount", sql.Numeric(16, 2), {
-      nullable: true,
-    });
-    table.columns.add("taxInclusiveAmount", sql.Numeric(16, 2), {
-      nullable: true,
-    });
-    table.columns.add("payableAmount", sql.Numeric(16, 2), { nullable: true });
+    const valueRows = chunk
+      .map(
+        (r) =>
+          `(${[
+            r.id,
+            escapeStr(r.irn),
+            escapeDate(r.issuedate),
+            escapeDate(r.tax_point_date),
+            escapeStr(r.document_currency_code),
+            escapeStr(r.type_code),
+            escapeStr(r.accounting_cost),
+            escapeStr(r.payment_status),
+            escapeStr(r.suppliertin),
+            escapeStr(r.customertin),
+            escapeNum(r.totaltaxamount),
+            escapeNum(r.subtotaltaxamount),
+            escapeNum(r.subtotaltaxableamount),
+            escapeStr(r.taxcategoryid),
+            escapeNum(r.taxcategorypercent),
+            escapeDate(r.paymentduedate),
+            escapeStr(r.paymentmeanscode),
+            escapeNum(r.taxexclusiveamount),
+            escapeNum(r.taxinclusiveamount),
+            escapeNum(r.payableamount),
+          ].join(",")})`,
+      )
+      .join(",\n");
 
-    for (const row of chunk) {
-      table.rows.add(
-        row.id,
-        row.irn,
-        row.issuedate,
-        row.tax_point_date,
-        row.document_currency_code,
-        row.type_code,
-        row.accounting_cost,
-        row.payment_status,
-        row.suppliertin,
-        row.customertin,
-        row.totaltaxamount,
-        row.subtotaltaxamount,
-        row.subtotaltaxableamount,
-        row.taxcategoryid,
-        row.taxcategorypercent,
-        row.paymentduedate,
-        row.paymentmeanscode,
-        row.taxexclusiveamount,
-        row.taxinclusiveamount,
-        row.payableamount,
-      );
-    }
+    const sql_stmt = `
+      INSERT INTO ${TABLE} (
+        id, irn, issueDate, taxPointDate, currencyCode, invoiceTypeCode,
+        accountingCost, paymentStatus, supplierTIN, customerTIN,
+        totalTaxAmount, subtotalTaxAmount, subtotalTaxableAmount,
+        taxCategoryId, taxCategoryPercent, paymentDueDate, paymentMeansCode,
+        taxExclusiveAmount, taxInclusiveAmount, payableAmount
+      )
+      VALUES ${valueRows};
+    `;
 
     try {
-      const result = await pool.request().bulk(table);
-      total += result.rowsAffected;
+      const result = await destPool.request().query(sql_stmt);
+      total += result.rowsAffected[0] ?? chunk.length;
     } catch (err) {
       const msg = (err as Error).message;
-      if (msg.includes("PRIMARY KEY") || msg.includes("duplicate")) {
-        log(`Duplicate keys in chunk ${i} — skipped`);
+      if (
+        msg.includes("PRIMARY KEY") ||
+        msg.includes("duplicate") ||
+        msg.includes("Violation of UNIQUE KEY")
+      ) {
+        // Fall back to row-by-row inserts to salvage non-duplicate rows
+        for (const row of chunk) {
+          try {
+            const singleSql = `
+              INSERT INTO ${TABLE} (
+                id, irn, issueDate, taxPointDate, currencyCode, invoiceTypeCode,
+                accountingCost, paymentStatus, supplierTIN, customerTIN,
+                totalTaxAmount, subtotalTaxAmount, subtotalTaxableAmount,
+                taxCategoryId, taxCategoryPercent, paymentDueDate, paymentMeansCode,
+                taxExclusiveAmount, taxInclusiveAmount, payableAmount
+              )
+              VALUES (${[
+                row.id,
+                escapeStr(row.irn),
+                escapeDate(row.issuedate),
+                escapeDate(row.tax_point_date),
+                escapeStr(row.document_currency_code),
+                escapeStr(row.type_code),
+                escapeStr(row.accounting_cost),
+                escapeStr(row.payment_status),
+                escapeStr(row.suppliertin),
+                escapeStr(row.customertin),
+                escapeNum(row.totaltaxamount),
+                escapeNum(row.subtotaltaxamount),
+                escapeNum(row.subtotaltaxableamount),
+                escapeStr(row.taxcategoryid),
+                escapeNum(row.taxcategorypercent),
+                escapeDate(row.paymentduedate),
+                escapeStr(row.paymentmeanscode),
+                escapeNum(row.taxexclusiveamount),
+                escapeNum(row.taxinclusiveamount),
+                escapeNum(row.payableamount),
+              ].join(",")});
+            `;
+            await destPool.request().query(singleSql);
+            total += 1;
+          } catch (rowErr) {
+            const rowMsg = (rowErr as Error).message;
+            if (
+              !rowMsg.includes("PRIMARY KEY") &&
+              !rowMsg.includes("duplicate") &&
+              !rowMsg.includes("Violation of UNIQUE KEY")
+            ) {
+              throw rowErr;
+            }
+          }
+        }
       } else {
         throw err;
       }
     }
   }
+
   return total;
 }
 
@@ -161,62 +221,63 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function processBatch(
+  sourcePool: Pool,
   destPool: sql.ConnectionPool,
   batchStart: number,
   batchEnd: number,
   attempt: number = 1,
 ): Promise<number> {
-  const source = new Client(SOURCE_CONFIG);
   try {
-    await source.connect();
-    log(`Querying ${batchStart} → ${batchEnd} (attempt ${attempt})`);
+    log(`[${batchStart}] Querying (attempt ${attempt})`);
 
-    const t0: number = Date.now();
-    const result = await source.query<InvoiceRow>(
+    const t0 = Date.now();
+    const result = await sourcePool.query<InvoiceRow>(
       buildQuery(batchStart, batchEnd),
     );
     const rows = result.rows;
-    await source.end();
+    const queryMs = Date.now() - t0;
 
     if (rows.length === 0) {
-      log(`Batch ${batchStart}-${batchEnd} — 0 rows, skipping`);
+      log(`[${batchStart}] 0 rows — skipping`);
       return 0;
     }
 
     log(
-      `${rows.length.toLocaleString()} rows fetched in ${((Date.now() - t0) / 1000).toFixed(1)}s, inserting...`,
+      `[${batchStart}] ${rows.length.toLocaleString()} rows fetched in ${(queryMs / 1000).toFixed(1)}s — inserting...`,
     );
 
-    const t1: number = Date.now();
+    const t1 = Date.now();
     const inserted = await insertRows(destPool, rows);
-    const durationMs = Date.now() - t1;
-    const rowsPerSecond = Math.round(inserted / (durationMs / 1000));
+    const insertMs = Date.now() - t1;
+    const rowsPerSecond = Math.round(inserted / (insertMs / 1000));
 
     log(
-      `Batch ${batchStart}-${batchEnd} done — ${inserted.toLocaleString()} rows inserted in ${(durationMs / 1000).toFixed(1)}s (${rowsPerSecond.toLocaleString()} rows/s)`,
+      `[${batchStart}] Done — ${inserted.toLocaleString()} rows in ${(insertMs / 1000).toFixed(1)}s (${rowsPerSecond.toLocaleString()} rows/s)`,
     );
 
-    // Save metrics for dashboard
     appendMetrics({
       batchStart,
       batchEnd,
       rowsInserted: inserted,
-      durationMs,
+      durationMs: insertMs,
       rowsPerSecond,
       completedAt: new Date().toISOString(),
     });
 
     return inserted;
   } catch (err) {
-    await source.end().catch(() => {});
     const message = (err as Error).message;
-    log(
-      `Batch ${batchStart}-${batchEnd} failed (attempt ${attempt}): ${message}`,
-    );
+    log(`[${batchStart}] Failed (attempt ${attempt}): ${message}`);
 
     if (attempt < MAX_RETRIES) {
       await sleep(RETRY_DELAY_MS);
-      return processBatch(destPool, batchStart, batchEnd, attempt + 1);
+      return processBatch(
+        sourcePool,
+        destPool,
+        batchStart,
+        batchEnd,
+        attempt + 1,
+      );
     }
 
     appendFailed({
@@ -230,24 +291,89 @@ async function processBatch(
   }
 }
 
+// ─── WORKER POOL ─────────────────────────────────────────────────────────────
+
+async function runWorkerPool(
+  sourcePool: Pool,
+  destPool: sql.ConnectionPool,
+  batches: { batchStart: number; batchEnd: number }[],
+  progress: Progress,
+  resumeFrom: number,
+): Promise<Progress> {
+  const queue = [...batches];
+  const completedStarts = new Set<number>();
+  let totalRowsInserted = progress.totalRowsInserted;
+  let totalBatchesCompleted = progress.totalBatchesCompleted;
+
+  const worker = async (): Promise<void> => {
+    while (true) {
+      const batch = queue.shift();
+      if (!batch) break;
+
+      const { batchStart, batchEnd } = batch;
+      const inserted = await processBatch(
+        sourcePool,
+        destPool,
+        batchStart,
+        batchEnd,
+      );
+
+      if (inserted >= 0) {
+        completedStarts.add(batchStart);
+        totalRowsInserted += inserted;
+        totalBatchesCompleted += 1;
+
+        let highestContiguous = resumeFrom - BATCH_SIZE;
+        let cursor = resumeFrom;
+        while (completedStarts.has(cursor)) {
+          highestContiguous = cursor;
+          cursor += BATCH_SIZE;
+        }
+
+        const updatedProgress: Progress = {
+          ...progress,
+          lastCompletedBatchStart: highestContiguous,
+          totalBatchesCompleted,
+          totalRowsInserted,
+          lastUpdatedAt: new Date().toISOString(),
+        };
+
+        saveProgress(updatedProgress);
+        progress = updatedProgress;
+
+        await sendTelegram(
+          `✅ *Batch Complete*\nRange: ${batchStart.toLocaleString()} → ${batchEnd.toLocaleString()}\nInserted: ${inserted.toLocaleString()}\nTotal batches: ${totalBatchesCompleted}\nTotal rows: ${totalRowsInserted.toLocaleString()}`,
+        );
+      } else {
+        await sendTelegram(
+          `❌ *Batch Failed*\nRange: ${batchStart.toLocaleString()} → ${batchEnd.toLocaleString()}\nCheck failed_ranges.json`,
+        );
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+  return progress;
+}
+
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
   ensureDirs();
   startApi();
 
-  const sourceClient = new Client(SOURCE_CONFIG);
-  await sourceClient.connect();
-  const maxResult = await sourceClient.query<{ max_id: string }>(
+  const sourcePool = new Pool(SOURCE_CONFIG);
+  sourcePool.on("error", (err) => log(`pg pool error: ${err.message}`));
+
+  const { rows } = await sourcePool.query<{ max_id: string }>(
     "SELECT MAX(id)::text AS max_id FROM invoices",
   );
-  const MAX_ID = parseInt(maxResult.rows[0].max_id, 10);
-  await sourceClient.end();
+  const MAX_ID = parseInt(rows[0].max_id, 10);
   log(`Source max ID: ${MAX_ID.toLocaleString()}`);
 
   log("Connecting to NRS_EDW...");
   const destPool = await sql.connect(DEST_CONFIG);
-  log("Connected to NRS_EDW");
+  log(`Connected to NRS_EDW (pool size: ${CONCURRENCY})`);
 
   let progress: Progress = loadProgress() ?? {
     lastCompletedBatchStart: MIN_ID - BATCH_SIZE,
@@ -258,42 +384,38 @@ async function main(): Promise<void> {
   };
 
   const resumeFrom = progress.lastCompletedBatchStart + BATCH_SIZE;
-  log(`Resuming from ID ${resumeFrom.toLocaleString()}`);
-
-  await sendTelegram(
-    `🚀 *Pipeline Started*\nMax ID: ${MAX_ID.toLocaleString()}\nResuming from: ${resumeFrom.toLocaleString()}\nBatches done: ${progress.totalBatchesCompleted}`,
+  log(
+    `Resuming from ID ${resumeFrom.toLocaleString()} with ${CONCURRENCY} concurrent workers`,
   );
 
-  for (
-    let batchStart = resumeFrom;
-    batchStart <= MAX_ID;
-    batchStart += BATCH_SIZE
-  ) {
-    const batchEnd = Math.min(batchStart + BATCH_SIZE - 1, MAX_ID);
-    const inserted = await processBatch(destPool, batchStart, batchEnd);
-
-    if (inserted >= 0) {
-      progress.lastCompletedBatchStart = batchStart;
-      progress.totalBatchesCompleted += 1;
-      progress.totalRowsInserted += inserted;
-      progress.lastUpdatedAt = new Date().toISOString();
-      saveProgress(progress);
-
-      await sendTelegram(
-        `✅ *Batch Complete*\nRange: ${batchStart.toLocaleString()} → ${batchEnd.toLocaleString()}\nInserted: ${inserted.toLocaleString()}\nTotal batches: ${progress.totalBatchesCompleted}\nTotal rows: ${progress.totalRowsInserted.toLocaleString()}`,
-      );
-    } else {
-      await sendTelegram(
-        `❌ *Batch Failed*\nRange: ${batchStart.toLocaleString()} → ${batchEnd.toLocaleString()}\nCheck failed_ranges.json`,
-      );
-    }
+  const batches: { batchStart: number; batchEnd: number }[] = [];
+  for (let s = resumeFrom; s <= MAX_ID; s += BATCH_SIZE) {
+    batches.push({
+      batchStart: s,
+      batchEnd: Math.min(s + BATCH_SIZE - 1, MAX_ID),
+    });
   }
+
+  log(`Total batches to process: ${batches.length.toLocaleString()}`);
+
+  await sendTelegram(
+    `🚀 *Pipeline Started*\nMax ID: ${MAX_ID.toLocaleString()}\nResuming from: ${resumeFrom.toLocaleString()}\nBatches remaining: ${batches.length}\nConcurrency: ${CONCURRENCY} workers`,
+  );
+
+  const finalProgress = await runWorkerPool(
+    sourcePool,
+    destPool,
+    batches,
+    progress,
+    resumeFrom,
+  );
 
   const failed = loadFailed();
   await sendTelegram(
-    `🏁 *Pipeline Complete*\nTotal batches: ${progress.totalBatchesCompleted}\nTotal rows: ${progress.totalRowsInserted.toLocaleString()}\nFailed ranges: ${failed.length}`,
+    `🏁 *Pipeline Complete*\nTotal batches: ${finalProgress.totalBatchesCompleted}\nTotal rows: ${finalProgress.totalRowsInserted.toLocaleString()}\nFailed ranges: ${failed.length}`,
   );
 
+  await sourcePool.end();
   await destPool.close();
 }
 

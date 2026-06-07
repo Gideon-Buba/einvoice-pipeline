@@ -10,6 +10,8 @@ export const SOURCE_CONFIG = {
   connectionTimeoutMillis: 30000,
   query_timeout: 1200000,
   ssl: { rejectUnauthorized: false },
+  max: parseInt(process.env["PG_POOL_SIZE"] ?? "4"),
+  idleTimeoutMillis: 60000,
 };
 
 export const DEST_CONFIG: sql.config = {
@@ -23,10 +25,17 @@ export const DEST_CONFIG: sql.config = {
     encrypt: false,
     trustServerCertificate: true,
     useUTC: false,
+    requestTimeout: 1200000,
+    enableArithAbort: true,
   },
   driver: "tedious",
-  connectionTimeout: 30000,
-  requestTimeout: 600000,
+  connectionTimeout: 60000,
+  requestTimeout: 1200000,
+  pool: {
+    max: parseInt(process.env["CONCURRENCY"] ?? "2"),
+    min: 1,
+    idleTimeoutMillis: 60000,
+  },
 };
 
 export const TELEGRAM_BOT_TOKEN = process.env["TELEGRAM_BOT_TOKEN"]!;
@@ -36,6 +45,7 @@ export const LOGS_DIR =
   process.env["LOGS_DIR"] ?? "/Users/user/Documents/pipeline-logs";
 export const BATCH_SIZE = parseInt(process.env["BATCH_SIZE"] ?? "250000");
 export const INSERT_CHUNK = parseInt(process.env["INSERT_CHUNK"] ?? "5000");
+export const CONCURRENCY = parseInt(process.env["CONCURRENCY"] ?? "2");
 export const MAX_RETRIES = 3;
 export const RETRY_DELAY_MS = 10_000;
 export const TABLE = "dbo.factInvoice";
