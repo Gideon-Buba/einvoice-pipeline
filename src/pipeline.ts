@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { Client } from "pg";
 import * as sql from "mssql";
+import { startApi } from "./api";
 import {
   SOURCE_CONFIG,
   DEST_CONFIG,
@@ -20,6 +21,7 @@ import {
   saveProgress,
   loadFailed,
   appendFailed,
+  appendMetrics,
 } from "./store";
 
 // ─── QUERY ───────────────────────────────────────────────────────────────────
@@ -187,9 +189,23 @@ async function processBatch(
 
     const t1: number = Date.now();
     const inserted = await insertRows(destPool, rows);
+    const durationMs = Date.now() - t1;
+    const rowsPerSecond = Math.round(inserted / (durationMs / 1000));
+
     log(
-      `Batch ${batchStart}-${batchEnd} done — ${inserted.toLocaleString()} rows inserted in ${((Date.now() - t1) / 1000).toFixed(1)}s`,
+      `Batch ${batchStart}-${batchEnd} done — ${inserted.toLocaleString()} rows inserted in ${(durationMs / 1000).toFixed(1)}s (${rowsPerSecond.toLocaleString()} rows/s)`,
     );
+
+    // Save metrics for dashboard
+    appendMetrics({
+      batchStart,
+      batchEnd,
+      rowsInserted: inserted,
+      durationMs,
+      rowsPerSecond,
+      completedAt: new Date().toISOString(),
+    });
+
     return inserted;
   } catch (err) {
     await source.end().catch(() => {});
@@ -218,11 +234,12 @@ async function processBatch(
 
 async function main(): Promise<void> {
   ensureDirs();
+  startApi();
 
   const sourceClient = new Client(SOURCE_CONFIG);
   await sourceClient.connect();
   const maxResult = await sourceClient.query<{ max_id: string }>(
-    "SELECT MAX(id)::text AS max_id FROM invoices"
+    "SELECT MAX(id)::text AS max_id FROM invoices",
   );
   const MAX_ID = parseInt(maxResult.rows[0].max_id, 10);
   await sourceClient.end();
@@ -244,10 +261,14 @@ async function main(): Promise<void> {
   log(`Resuming from ID ${resumeFrom.toLocaleString()}`);
 
   await sendTelegram(
-    `🚀 *Pipeline Started*\nMax ID: ${MAX_ID.toLocaleString()}\nResuming from: ${resumeFrom.toLocaleString()}\nBatches done: ${progress.totalBatchesCompleted}`
+    `🚀 *Pipeline Started*\nMax ID: ${MAX_ID.toLocaleString()}\nResuming from: ${resumeFrom.toLocaleString()}\nBatches done: ${progress.totalBatchesCompleted}`,
   );
 
-  for (let batchStart = resumeFrom; batchStart <= MAX_ID; batchStart += BATCH_SIZE) {
+  for (
+    let batchStart = resumeFrom;
+    batchStart <= MAX_ID;
+    batchStart += BATCH_SIZE
+  ) {
     const batchEnd = Math.min(batchStart + BATCH_SIZE - 1, MAX_ID);
     const inserted = await processBatch(destPool, batchStart, batchEnd);
 
@@ -259,18 +280,18 @@ async function main(): Promise<void> {
       saveProgress(progress);
 
       await sendTelegram(
-        `✅ *Batch Complete*\nRange: ${batchStart.toLocaleString()} → ${batchEnd.toLocaleString()}\nInserted: ${inserted.toLocaleString()}\nTotal batches: ${progress.totalBatchesCompleted}\nTotal rows: ${progress.totalRowsInserted.toLocaleString()}`
+        `✅ *Batch Complete*\nRange: ${batchStart.toLocaleString()} → ${batchEnd.toLocaleString()}\nInserted: ${inserted.toLocaleString()}\nTotal batches: ${progress.totalBatchesCompleted}\nTotal rows: ${progress.totalRowsInserted.toLocaleString()}`,
       );
     } else {
       await sendTelegram(
-        `❌ *Batch Failed*\nRange: ${batchStart.toLocaleString()} → ${batchEnd.toLocaleString()}\nCheck failed_ranges.json`
+        `❌ *Batch Failed*\nRange: ${batchStart.toLocaleString()} → ${batchEnd.toLocaleString()}\nCheck failed_ranges.json`,
       );
     }
   }
 
   const failed = loadFailed();
   await sendTelegram(
-    `🏁 *Pipeline Complete*\nTotal batches: ${progress.totalBatchesCompleted}\nTotal rows: ${progress.totalRowsInserted.toLocaleString()}\nFailed ranges: ${failed.length}`
+    `🏁 *Pipeline Complete*\nTotal batches: ${progress.totalBatchesCompleted}\nTotal rows: ${progress.totalRowsInserted.toLocaleString()}\nFailed ranges: ${failed.length}`,
   );
 
   await destPool.close();

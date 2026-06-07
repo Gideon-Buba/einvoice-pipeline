@@ -14,6 +14,15 @@ export interface FailedRange {
   attempts: number;
 }
 
+export interface BatchMetrics {
+  batchStart: number;
+  batchEnd: number;
+  rowsInserted: number;
+  durationMs: number;
+  rowsPerSecond: number;
+  completedAt: string;
+}
+
 export interface InvoiceRow {
   id: number | null;
   irn: string | null;
